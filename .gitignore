@@ -4,6 +4,7 @@
 archive/
 output_logs/
 ssl/
+stored_data/
 
 
 # Byte-compiled / optimized / DLL files
