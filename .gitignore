@@ -1,3 +1,11 @@
+# FILES WE DO NOT WANT PUBLIC
+.pages
+.env
+archive/
+output_logs/
+ssl/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
