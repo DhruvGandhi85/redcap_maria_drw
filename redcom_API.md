@@ -41,7 +41,7 @@ For use in the Flask app, reads the last 10 lines of the log file and returns th
 ```python
 send_email(
     message: 'str' = '',
-    recipient_emails: 'list' = ['']
+    recipient_emails: 'list' = ['marcus.lehr@tufts.edu']
 ) → str
 ```
 
@@ -68,7 +68,7 @@ Sends an email alert to the specified recipient(s) with the specified message.
 ```python
 send_error_email(
     message: 'str' = '',
-    recipient_emails: 'list' = ['']
+    recipient_emails: 'list' = ['marcus.lehr@tufts.edu']
 ) → str
 ```
 
@@ -1131,6 +1131,29 @@ Prepares the necessary data to be entered into the redcap_data_quality_status an
 
 ---
 
+## <kbd>function</kbd> `find_outliers_chauvenet`
+
+```python
+find_outliers_chauvenet(df: 'pd.DataFrame') → pd.DataFrame
+```
+
+Finds outliers in a DataFrame using Chauvenet's criterion. Pseudocode (chau_peirce_thomson.pdf): 1. Calculate mean and std 2. If n · erfc(|value - mean|/ std) < 1/2 then reject value 3. Repeat steps 1 and 2 4. Report final mean, std, and n 
+
+
+
+**Args:**
+ 
+ - <b>`df`</b> (pd.DataFrame):  The DataFrame to find outliers in 
+
+
+
+**Returns:**
+ 
+ - <b>`pd.DataFrame`</b>:  A DataFrame containing only the outliers 
+
+
+---
+
 ## <kbd>function</kbd> `get_entry_of_outlier`
 
 ```python
@@ -1166,29 +1189,6 @@ Retrieves the user_id, username, and email of the data entrist by filtering on t
 **Returns:**
  
  - <b>`tuple[int,str,str]`</b>:  A tuple containing the user_id, username, and email of the data entry 
-
-
----
-
-## <kbd>function</kbd> `find_outliers_chauvenet`
-
-```python
-find_outliers_chauvenet(df: 'pd.DataFrame') → pd.DataFrame
-```
-
-Finds outliers in a DataFrame using Chauvenet's criterion. Pseudocode (chau_peirce_thomson.pdf): 1. Calculate mean and std 2. If n · erfc(|value - mean|/ std) < 1/2 then reject value 3. Repeat steps 1 and 2 4. Report final mean, std, and n 
-
-
-
-**Args:**
- 
- - <b>`df`</b> (pd.DataFrame):  The DataFrame to find outliers in 
-
-
-
-**Returns:**
- 
- - <b>`pd.DataFrame`</b>:  A DataFrame containing only the outliers 
 
 
 ---
@@ -1300,7 +1300,7 @@ create_data_res_workflow_entry(
     user_id: 'int',
     ping: 'bool',
     comment: 'str',
-    ts: 'datetime.datetime' = datetime.datetime(2024, 12, 19, 20, 10, 42, 544150, tzinfo=datetime.timezone.utc)
+    ts: 'datetime.datetime' = datetime.datetime(2024, 12, 20, 17, 26, 55, 216096, tzinfo=datetime.timezone.utc)
 ) → None
 ```
 
@@ -1591,7 +1591,10 @@ Submits a new data entry to the redcap_data_quality_status and redcap_data_quali
 ## <kbd>function</kbd> `submit_stored_drw_entries`
 
 ```python
-submit_stored_drw_entries(production_mode: 'bool' = False) → None
+submit_stored_drw_entries(
+    alert_threshold: 'int' = 100,
+    production_mode: 'bool' = False
+) → None
 ```
 
 Retrieves csv file with stored DRW entries and submits any entries that do not exist in the DRW to REDCap 
@@ -1600,6 +1603,7 @@ Retrieves csv file with stored DRW entries and submits any entries that do not e
 
 **Args:**
  
+ - <b>`alert_threshold`</b> (int, optional):  The threshold for the number of entries to submit (default is 100) 
  - <b>`production_mode`</b> (bool, optional):  A boolean indicating whether to run in production mode (default is False) 
 
 
@@ -1860,7 +1864,8 @@ Checks for all missing data entries and outlier data in the data dictionary and 
  None 
 
 
----
 
+
+---
 
 _This file was automatically generated via [lazydocs](https://github.com/ml-tooling/lazydocs)._

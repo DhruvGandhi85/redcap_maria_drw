@@ -10,8 +10,8 @@
 - **rootdir**
 - **logdir**
 - **logfile**
-- **outlier_method**
 - **pid_list**
+- **outlier_method**
 - **alert_threshold**
 - **ping**
 - **production_mode**
