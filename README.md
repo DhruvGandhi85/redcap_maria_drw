@@ -52,7 +52,7 @@
 - [`redcom_API.get_username`](./redcom_API.md#function-get_username): Retrieves the username of the recipient of the message from the redcap_user_information table.
 - [`redcom_API.missing_data_submission`](./redcom_API.md#function-missing_data_submission): Submits a new data entry to the redcap_data_quality_status and redcap_data_quality_resolutions tables after checking for duplicates.
 - [`redcom_API.navigate_branching_logic`](./redcom_API.md#function-navigate_branching_logic): This function navigates the branching logic of the personalized data dictionary to remove rows that do not meet the criteria of the branching logic.
-- [`redcom_API.operate_missing_qc`](./redcom_API.md#function-operate_missing_qc): Args:
+- [`redcom_API.operate_missing_qc`](./redcom_API.md#function-operate_missing_qc): Operates the missing data detection and submission process for a given DataFrame. Finds fields that have been filled out at least once and checks for missing data entries.
 - [`redcom_API.operate_outlier_qc`](./redcom_API.md#function-operate_outlier_qc): Operates the outlier detection and submission process for a given DataFrame.
 - [`redcom_API.operate_quality_control_individual`](./redcom_API.md#function-operate_quality_control_individual): Operates the quality control process on a data entry.
 - [`redcom_API.operate_quality_control_routine`](./redcom_API.md#function-operate_quality_control_routine): Operates the quality control process on a data entry.
