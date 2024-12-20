@@ -1625,6 +1625,7 @@ operate_missing_qc(
 ) → None
 ```
 
+Operates the missing data detection and submission process for a given DataFrame. Finds fields that have been filled out at least once and checks for missing data entries.
 
 
 **Args:**
