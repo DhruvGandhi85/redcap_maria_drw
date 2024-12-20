@@ -85,7 +85,6 @@
 - [`redcom_API.store_project_data`](./redcom_API.md#function-store_project_data): Retrieves redcap_projects table from the mariaDB server and stores it locally as a CSV file.
 - [`redcom_API.store_user_roles`](./redcom_API.md#function-store_user_roles): Stores the user roles locally as a CSV file.
 - [`redcom_API.submit_stored_drw_entries`](./redcom_API.md#function-submit_stored_drw_entries): Retrieves csv file with stored DRW entries and submits any entries that do not exist in the DRW to REDCap
-- [`redcom_API.test`](./redcom_API.md#function-test)
 - [`app.common_troubleshooting`](./app.md#function-common_troubleshooting): Returns common troubleshooting fixes.
 - [`app.default_page`](./app.md#function-default_page): Returns the default webpage structure with routing, troubleshooting, and log file.
 - [`app.home`](./app.md#function-home): Routed from / and /flaskApp/.
@@ -93,7 +92,6 @@
 - [`app.outlier_and_missing_routine`](./app.md#function-outlier_and_missing_routine): Runs when triggered by POST request from MariaDB.
 - [`app.receive_from_maria`](./app.md#function-receive_from_maria): Runs when triggered by POST request from MariaDB. 
 - [`app.routing_links`](./app.md#function-routing_links): Returns the webpage routes.
-- [`app.update_data_dic_triggers`](./app.md#function-update_data_dic_triggers): Routed from /flaskApp/update-data-dic/ and when triggered by POST request from MariaDB.
 - [`app.update_triggers`](./app.md#function-update_triggers): Routed from /flaskApp/update-triggers/ and when triggered by POST request from MariaDB.
 
 
