@@ -1,6 +1,7 @@
 from __future__ import annotations          # allows for more strict type hinting (documentation)
 import dotenv           # loads system environment
 import os               # accesses system environment for stored private variables
+import gc               # garbage collection for memory management
 import mariadb          # create connection to mdb server
 import sys              # kills process if necessary
 import re               # regex for data manipulation 
@@ -131,7 +132,7 @@ def send_error_email(message: str = '', recipient_emails: list = [os.environ.get
     msg = MIMEMultipart()
     msg['From'] = sender_email
     msg['To'] = ", ".join(recipient_emails) if isinstance(recipient_emails, list) else recipient_emails
-    msg['Subject'] = "Automation Process Failed"
+    msg['Subject'] = "Automation Process Alert"
     body = (
         "We encountered an issue while attempting to execute the automation process. "
         "Please review the system logs or contact the support team to address the issue.\n\n"
@@ -393,7 +394,8 @@ def store_user_roles() -> None:
 
     user_roles["data_entry"] = user_roles["data_entry"].str.findall(r"\[(.*?)\]") 
     df_exploded = user_roles.explode("data_entry", ignore_index=True)  
-    df_exploded[["form_name", "permission"]] = df_exploded["data_entry"].str.split(",", expand=True) 
+    df_exploded[["form_name", "permission"]] = df_exploded["data_entry"].str.split(",", expand=True)
+    # df_exploded = df_exploded.drop(columns = "data_entry")
 
     df_exploded.to_csv(f'{path}\\user_roles.csv', index = False)
 
@@ -651,7 +653,7 @@ def refresh_background_trigger() -> None:
     """
     conn = connect_to_maria()
     refresh_necessary_log_event_triggers(conn)
-    refresh_necessary_data_table_triggers(conn)
+    # refresh_necessary_data_table_triggers(conn)
     conn.close()
     return None
 
@@ -670,7 +672,10 @@ def retrieve_default_reviewer(project_id: int, form_name: str) -> pd.DataFrame:
     user_roles = retrieve_user_roles()
 
     default_reviewers = default_reviewers[default_reviewers['project_id'] == project_id]
-    user_roles = user_roles[(user_roles['project_id'] == project_id) & (user_roles['form_name'] == form_name) & (user_roles['permission'] == 2)]
+    # permission 0: No access, 1: View and Edit, 2: Read Only
+    user_roles = user_roles[(user_roles['project_id'] == project_id) & 
+                            (user_roles['form_name'] == form_name) & 
+                            (user_roles['permission'] == 1)]
     default_reviewers = default_reviewers.merge(user_roles, on = ['project_id', 'role_name'])
 
     return default_reviewers
@@ -800,6 +805,112 @@ def get_current_drw_count() -> int:
 
     return status_id_count
 
+def filter_log_event_table(log_event_table: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filters the log_event table to only hold Data Entry pages rather than administrative logging.
+
+    Args:
+        log_event_table (pd.DataFrame): A pandas DataFrame containing the log_event table
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame containing the filtered log_event table
+    """
+    data_entry_table = log_event_table[
+        (log_event_table['description'].isin(["Update record", "Create record"])) &
+        (log_event_table['page'].isin(["DataEntry/index.php", "ProjectGeneral/create_project.php"])) &
+        (log_event_table['object_type'] == "redcap_data") &
+        (log_event_table['data_values'].notna() &
+        log_event_table['sql_log'].notna())
+    ]
+
+    # display(data_entry_table)
+
+    # data_values and sql_log are all grouped up in one row per form submission as a string. Splits these strings into lists for easier manipulation
+    data_entry_table['data_values'] = data_entry_table['data_values'].str.split(',\n')
+    data_entry_table['sql_log'] = data_entry_table['sql_log'].str.split(';\n')
+    
+    # sets default instance to 1 rather than None
+    data_entry_table['instance'] = 1
+    # data_entry_table['group_id'] = 1
+
+    # if the data_values is of an instance greater than 1, seperates the instance into a seperate column and removes it from data_values so data_values and sql_log have the same length
+    for index, row in data_entry_table.iterrows():
+        if isinstance(row['data_values'], list) and len(row['data_values']) > 0:
+            first_item = row['data_values'][0]
+            if first_item.startswith('[instance = '):
+                instance_value = int(first_item.split('=')[1].strip(']'))
+                data_entry_table.at[index, 'instance'] = instance_value
+                
+                data_value_without_instance = row['data_values'][1:]
+                data_entry_table.at[index, 'data_values'] = data_value_without_instance
+        if isinstance(row['sql_log'], list) and len(row['sql_log']) > 0:
+            first_item = row['sql_log'][0]
+            if '__GROUPID__' in first_item:
+               
+                sql_log_without_group = row['sql_log'][2:]
+                data_entry_table.at[index, 'sql_log'] = sql_log_without_group
+            
+            # second_item = row['sql_log'][1]
+            # if second_item.startswith('UPDATE redcap_edocs_metadata'):
+            sql_log_filtered = [item for item in data_entry_table.at[index, 'sql_log'] if not item.startswith('update redcap_edocs_metadata')]
+            data_entry_table.at[index, 'sql_log'] = sql_log_filtered
+    mismatched_rows = data_entry_table[data_entry_table['data_values'].apply(len) != data_entry_table['sql_log'].apply(len)]
+    mismatched_rows['len_data_values'] = mismatched_rows['data_values'].apply(len)
+    mismatched_rows['len_sql_log'] = mismatched_rows['sql_log'].apply(len)
+
+    if not mismatched_rows.empty:
+        # display(mismatched_rows)
+        logging.error(f"Data values and SQL log lengths do not match for {len(mismatched_rows)} rows.")
+    
+    # INSERT INTO redcap_data (project_id, event_id, record, field_name, value, instance) VALUES (131, 749, '30-1', '__GROUPID__', '30', NULL), UPDATE redcap_events_calendar SET group_id = '30' WHERE project_id = 131 AND record = '30-1', 
+    data_entry_table = data_entry_table.explode(['data_values', 'sql_log']).reset_index(drop=True)
+
+    # splits field_name and value into individual columns and sets type for relevant columns
+    # print(data_entry_table)
+    if not data_entry_table.empty:
+        data_entry_table[['field_name', 'value']] = data_entry_table['data_values'].str.split(' = ',expand=True)
+        data_entry_table = data_entry_table.astype({'project_id': int, 'event_id': int, 'pk': int, 'instance': int, 'field_name': str, 'value': str})
+
+
+    return data_entry_table
+
+def get_unioned_super_table(pid_list: list) -> pd.DataFrame:
+    
+    data_table_names = []
+    log_event_table_names = []
+    
+    for pid in pid_list:
+        log_table_name, data_table_name = get_log_event_and_data_tables(pid)
+        for data_table in data_table_name:
+            table = retrieve_database_table([data_table])
+            d_table = table[data_table]
+            d_table = d_table[d_table['project_id'] == pid]
+            d_table = filter_data_table(d_table)
+            data_table_names.append(d_table)
+        for log_table in log_table_name:
+            table = retrieve_database_table([log_table])
+            l_table = table[log_table]
+            l_table = l_table[l_table['project_id'] == pid]
+            l_table = filter_log_event_table(l_table)
+            log_event_table_names.append(l_table)
+
+
+    unioned_log_table = pd.concat(log_event_table_names)
+    unioned_data_table = pd.concat(data_table_names)
+    
+    # loads user info table and merges with log table to find user_id
+    user_info_table = retrieve_database_table(['redcap_user_information'])
+    user_info = user_info_table['redcap_user_information']
+    user_info = user_info[['ui_id', 'username', 'user_email']]
+    unioned_log_table = (unioned_log_table.merge(user_info, left_on = 'user', right_on = 'username')).drop(columns=['username'])
+
+    data_dictionary = retrieve_data_dictionary()
+    data_dictionary = data_dictionary[['project_id', 'field_name','form_name']]
+    unioned_data_table = (unioned_data_table.merge(data_dictionary, on = ['project_id', 'field_name']))
+
+    unioned_super_table = unioned_data_table.merge(unioned_log_table, on=['project_id', 'event_id', 'pk', 'instance', 'field_name', 'value'])
+
+    return unioned_super_table
 def resolve_open_queries(pid_list: list, production_mode: bool = False) -> None:
     """
     Resolves open queries for missing data in the redcap_data_quality_resolutions and redcap_data_quality_status tables by 
@@ -1047,60 +1158,6 @@ def check_drw_enabled(pid_list: list) -> None:
 
     return None
 
-def filter_log_event_table(log_event_table: pd.DataFrame) -> pd.DataFrame:
-    """
-    Filters the log_event table to only hold Data Entry pages rather than administrative logging.
-
-    Args:
-        log_event_table (pd.DataFrame): A pandas DataFrame containing the log_event table
-
-    Returns:
-        pd.DataFrame: A pandas DataFrame containing the filtered log_event table
-    """
-    data_entry_table = log_event_table[
-        (log_event_table['description'].isin(["Update record", "Create record"])) &
-        (log_event_table['page'].isin(["DataEntry/index.php", "ProjectGeneral/create_project.php"])) &
-        (log_event_table['object_type'] == "redcap_data") &
-        (log_event_table['data_values'].notna() &
-        log_event_table['sql_log'].notna())
-    ]
-
-
-    # data_values and sql_log are all grouped up in one row per form submission as a string. Splits these strings into lists for easier manipulation
-    data_entry_table['data_values'] = data_entry_table['data_values'].str.split(',\n')
-    data_entry_table['sql_log'] = data_entry_table['sql_log'].str.split(';\n')
-    
-    # sets default instance to 1 rather than None
-    data_entry_table['instance'] = 1
-
-    # if the data_values is of an instance greater than 1, seperates the instance into a seperate column and removes it from data_values so data_values and sql_log have the same length
-    for index, row in data_entry_table.iterrows():
-        if isinstance(row['data_values'], list) and len(row['data_values']) > 0:
-            first_item = row['data_values'][0]
-            if first_item.startswith('[instance = '):
-                instance_value = int(first_item.split('=')[1].strip(']'))
-                data_entry_table.at[index, 'instance'] = instance_value
-                
-                data_value_without_instance = row['data_values'][1:]
-                data_entry_table.at[index, 'data_values'] = data_value_without_instance
-
-    # mismatched_rows = data_entry_table[data_entry_table['data_values'].apply(len) != data_entry_table['sql_log'].apply(len)]
-    # mismatched_rows['len_data_values'] = mismatched_rows['data_values'].apply(len)
-    # mismatched_rows['len_sql_log'] = mismatched_rows['sql_log'].apply(len)
-
-    # display(mismatched_rows)
-
-    data_entry_table = data_entry_table.explode(['data_values', 'sql_log']).reset_index(drop=True)
-
-    # splits field_name and value into individual columns and sets type for relevant columns
-    # print(data_entry_table)
-    if not data_entry_table.empty:
-        data_entry_table[['field_name', 'value']] = data_entry_table['data_values'].str.split(' = ',expand=True)
-        data_entry_table = data_entry_table.astype({'project_id': int, 'event_id': int, 'pk': int, 'instance': int, 'field_name': str, 'value': str})
-
-
-    return data_entry_table
-
 def prepare_mess_data(mess_tables: dict, author_user_id: int, recipient_user_id: int, sent_time: datetime.datetime, project_id: int, status: str, status_id: int) -> list:
     """
     Prepares the necessary data to be entered into the redcap_messages, redcap_messages_recipients, and redcap_messages_threads tables.
@@ -1225,12 +1282,13 @@ def prepare_drw_data(dq_tables: dict, ts: datetime.datetime, project_id: int, ev
 
     return data_rows
 
-def get_entry_of_outlier(conn: mariadb.connections.Connection, project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int) -> tuple[int,str,str]:
+def get_entry_of_outlier(unioned_super_table: pd.DataFrame, project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int) -> tuple[int,str,str]:
     """
-    Retrieves the user_id and username of the data entrist by filtering on the hnrcid, event_id, field_name, and instance attributes.
+    Retrieves the user_id, username, and email of the data entrist by filtering on the hnrcid, event_id, field_name, and instance attributes.
+    Currently returns the user with the most entries in the filtered table. 
 
     Args:
-        conn (mariadb.connections.Connection): The active connection to the mariaDB server
+        unioned_super_table (pd.DataFrame): A pandas DataFrame containing the unioned super table
         project_id (int): The project_id of the data entry
         event_id (int): The event_id of the data entry
         hnrcid (int): The hnrcid of the data entry
@@ -1242,43 +1300,6 @@ def get_entry_of_outlier(conn: mariadb.connections.Connection, project_id: int, 
     Returns:
         tuple[int,str,str]: A tuple containing the user_id, username, and email of the data entry
     """
-    # imported studies have multiple project_ids and therefore need to be joined before processing
-    log_event_tables, data_tables = get_log_event_and_data_tables(conn, project_id)
-    table_name = []
-    for log_event_table in range(len(log_event_tables)):
-        table_name.append(log_event_tables[log_event_table])
-    table_name.append('redcap_user_information')
-    for data_table in range(len(data_tables)):
-        table_name.append(data_tables[data_table])
-    col_names = get_colnames(conn, table_name)
-    table_data = get_table_data(conn, col_names)
-
-    unioned_log_table = pd.DataFrame(columns=col_names[table_name[0]])
-    unioned_data_table = pd.DataFrame(columns=['project_id', 'event_id', 'pk', 'instance', 'field_name', 'value'])
-
-    for log_event_table in range(len(log_event_tables)):
-        # loads relevant log table and splits multi-entries into individual rows
-        table = filter_log_event_table(table_data[log_event_tables[log_event_table]])
-        unioned_log_table = unioned_log_table.append(table, ignore_index=True)
-    
-    for data_table in range(len(data_tables)):
-        # loads relevant data table
-        table = filter_data_table(table_data[data_tables[data_table]])
-        unioned_data_table = unioned_data_table.append(table, ignore_index=True)
-    
-    # loads user info table and merges with log table to find user_id
-    user_info = table_data['redcap_user_information'][['ui_id', 'username', 'user_email']]
-    unioned_log_table = (unioned_log_table.merge(user_info, left_on = 'user', right_on = 'username')).drop(columns=['username'])
-
-    data_dictionary = retrieve_data_dictionary()
-    data_dictionary = data_dictionary[['project_id', 'field_name','form_name']]
-    unioned_data_table = (unioned_data_table.merge(data_dictionary, on = ['project_id', 'field_name']))
-
-    cols = ['project_id', 'event_id', 'pk', 'instance', 'field_name', 'value']
-    
-    unioned_super_table = unioned_data_table.merge(unioned_log_table, left_on=cols, right_on=cols)
-
-    # display(unioned_super_table)
 
     # table with all of that patient's data entries for that project. requires a user to proceed. needs to be one entry. 
     # outlier['event_id'] needs to be equal to event_id
@@ -1289,33 +1310,33 @@ def get_entry_of_outlier(conn: mariadb.connections.Connection, project_id: int, 
 
     # print(f"{project_id} {event_id} {hnrcid} {field_name} {value} {repeat_instance}")
 
-    outlier = unioned_super_table.copy()
-    if len(outlier[(outlier['form_name'] == form_name)]) > 0:
-        outlier = outlier[(outlier['form_name'] == form_name)]
+    if len(unioned_super_table[(unioned_super_table['form_name'] == form_name)]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['form_name'] == form_name)]
         
-    if len(outlier[(outlier['event_id'].astype(int) == int(event_id))]) > 0:
-        outlier = outlier[(outlier['event_id'].astype(int) == int(event_id))]
+    if len(unioned_super_table[(unioned_super_table['event_id'].astype(int) == int(event_id))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['event_id'].astype(int) == int(event_id))]
 
-    if len(outlier[(outlier['field_name'] == field_name)]) > 0:
-        outlier = outlier[(outlier['field_name'] == field_name)]
+    if len(unioned_super_table[(unioned_super_table['field_name'] == field_name)]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['field_name'] == field_name)]
 
-    if len(outlier[(outlier['pk'].astype(int) == int(hnrcid))]) > 0:
-        outlier = outlier[(outlier['pk'].astype(int) == int(hnrcid))]
+    if len(unioned_super_table[(unioned_super_table['pk'].astype(int) == int(hnrcid))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['pk'].astype(int) == int(hnrcid))]
 
-    if len(outlier[(outlier['instance'].astype(int) == int(repeat_instance))]) > 0:
-        outlier = outlier[(outlier['instance'].astype(int) == int(repeat_instance))]
+    if len(unioned_super_table[(unioned_super_table['instance'].astype(int) == int(repeat_instance))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['instance'].astype(int) == int(repeat_instance))]
 
     # display(outlier)
 
-    if len(outlier) == 0:
-        outlier = retrieve_default_reviewer(project_id, form_name).reset_index(drop=True)
-        first_entry = outlier.iloc[0]
+    if len(unioned_super_table) == 0:
+        unioned_super_table = retrieve_default_reviewer(project_id, form_name).reset_index(drop=True)
+        first_entry = unioned_super_table.iloc[0]
         official_user_id = int(first_entry['ui_id'])
         official_username = str(first_entry['user'])
         official_email = str(first_entry['user_email'])
     else:
-        outlier = outlier.reset_index(drop=True)
-        first_entry = outlier.iloc[0]
+        unioned_super_table = unioned_super_table.reset_index(drop=True)
+        max_user_id = unioned_super_table['ui_id'].value_counts().idxmax()
+        first_entry = unioned_super_table[unioned_super_table['ui_id'] == max_user_id].iloc[0]
 
         official_user_id = int(first_entry['ui_id'])
         official_username = str(first_entry['user'])
@@ -1605,7 +1626,7 @@ def check_existing_drw_entry(project_id: int, event_id: int, hnrcid: int, field_
 
     return dq_status
 
-def data_workflow_submission(project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int, ping: bool = True) -> None:
+def outlier_data_submission(project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int, official_user_id: int, username: str, email: str, ping: bool = True) -> None:
     """
     Submits a new data entry to the redcap_data_quality_status and redcap_data_quality_resolutions tables after checking for duplicates.
 
@@ -1617,6 +1638,9 @@ def data_workflow_submission(project_id: int, event_id: int, hnrcid: int, form_n
         field_name (str): The field_name of the data entry
         value (str): The value of the data entry
         repeat_instance (int): The repeat_instance of the data entry
+        official_user_id (int): The user_id of the recipient of the data query
+        username (str): The username of the recipient of the data query
+        email (str): The email of the recipient of the data query
         ping (bool, optional): A boolean indicating whether to send a message to the recipient (default is True)
 
     Returns:
@@ -1624,7 +1648,6 @@ def data_workflow_submission(project_id: int, event_id: int, hnrcid: int, form_n
     """
     conn = connect_to_maria()
 
-    official_user_id, username, email = get_entry_of_outlier(conn, project_id, event_id, hnrcid, form_name, field_name, value, repeat_instance)
     log_msg = f'project_id {project_id}, hnrcid {hnrcid}, event_id {event_id}, repeat_instance {repeat_instance}, field_name {field_name}, value {value}, user {official_user_id}: {username} {email}. '
 
     dq_status = check_existing_drw_entry(project_id, event_id, hnrcid, field_name, official_user_id, repeat_instance)
@@ -1650,13 +1673,14 @@ def data_workflow_submission(project_id: int, event_id: int, hnrcid: int, form_n
 
     return None
 
-def operate_outlier_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.DataFrame, outlier_method: str = 'Chauvanet', production_mode: bool = False) -> None:
+def operate_outlier_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.DataFrame, unioned_super_table: pd.DataFrame, outlier_method: str = 'Chauvanet', production_mode: bool = False) -> None:
     """
     Operates the outlier detection and submission process for a given DataFrame.
 
     Args:
         merged_data_table (pd.DataFrame): The DataFrame containing all the data for the relevant project
         data_entry_table (pd.DataFrame): The DataFrame containing the data that has been submitted
+        unioned_super_table (pd.DataFrame): The DataFrame containing the unioned super table
         outlier_method (str, optional): The method to use for outlier detection (default is 'Chauvanet')
         production_mode (bool, optional): A boolean indicating whether to run in production mode (default is False)
 
@@ -1709,6 +1733,8 @@ def operate_outlier_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.Dat
         # logging.info(f"Detected outlier using {outlier_method}: {outliers}")
         outlier_list.append(outliers)
     
+
+
     # Submits a data resolution workflow entry for each outlier
     with open('stored_data/drw_entries.csv', 'a', newline='') as file:
         for df in outlier_list:
@@ -1720,20 +1746,21 @@ def operate_outlier_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.Dat
                 # df = df[df['_merge'] == 'left_only'].drop('_merge', axis=1)
                 # display(df)
             for index, rows in df.iterrows():
-                if production_mode:
-                    logging.info(f"Detected outlier using {outlier_method}: {rows['project_id']}: {rows['event_id']}, {rows['record']} - {rows['field_name']} - {rows['value']} - {rows['instance']}")
-                    data_workflow_submission(rows['project_id'], rows['event_id'], rows['record'], rows['form_name'], rows['field_name'], rows['value'], rows['instance'])
-                file.write(f"{rows['project_id']},{rows['event_id']},{rows['record']},{rows['form_name']},{rows['field_name']},{rows['value']},{rows['instance']}\n")
+                official_user_id, username, email = get_entry_of_outlier(unioned_super_table, rows['project_id'], rows['event_id'], rows['record'], rows['form_name'], rows['field_name'], rows['value'], rows['instance'])
+                # if production_mode:
+                    # logging.info(f"Detected outlier using {outlier_method}: {rows['project_id']}: {rows['event_id']}, {rows['record']} - {rows['field_name']} - {rows['value']} - {rows['instance']}")
+                    # outlier_data_submission(rows['project_id'], rows['event_id'], rows['record'], rows['form_name'], rows['field_name'], rows['value'], rows['instance'], official_user_id, username, email)
+                file.write(f"{rows['project_id']},{rows['event_id']},{rows['record']},{rows['form_name']},{rows['field_name']},{rows['value']},{rows['instance']},{official_user_id},{username},{email},\n")
 
     logging.info(f"Completed outlier detection and submission for project {project_id} and field {field_name}.")
     return None
 
-def get_entry_of_missing(conn: mariadb.connections.Connection, project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int) -> tuple[int,str,str]:
+def get_entry_of_missing(unioned_super_table: pd.DataFrame, project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int) -> tuple[int,str,str]:
     """
     Retrieves the user_id and username of the data entrist by filtering on the hnrcid, event_id, field_name, and instance attributes.
 
     Args:
-        conn (mariadb.connections.Connection): The active connection to the mariaDB server
+        unioned_super_table (pd.DataFrame): The DataFrame containing all the data for the relevant project
         project_id (int): The project_id of the data entry
         event_id (int): The event_id of the data entry
         hnrcid (int): The hnrcid of the data entry
@@ -1746,40 +1773,7 @@ def get_entry_of_missing(conn: mariadb.connections.Connection, project_id: int, 
         tuple[int,str,str]: A tuple containing the user_id, username, and email of the data entry
     """
     # imported studies have multiple project_ids and therefore need to be joined before processing
-    log_event_tables, data_tables = get_log_event_and_data_tables(conn, project_id)
-    table_name = []
-    for log_event_table in range(len(log_event_tables)):
-        table_name.append(log_event_tables[log_event_table])
-    table_name.append('redcap_user_information')
-    for data_table in range(len(data_tables)):
-        table_name.append(data_tables[data_table])
-    col_names = get_colnames(conn, table_name)
-    table_data = get_table_data(conn, col_names)
 
-    unioned_log_table = pd.DataFrame(columns=col_names[table_name[0]])
-    unioned_data_table = pd.DataFrame(columns=['project_id', 'event_id', 'pk', 'instance', 'field_name', 'value'])
-
-    for log_event_table in range(len(log_event_tables)):
-        # loads relevant log table and splits multi-entries into individual rows
-        table = filter_log_event_table(table_data[log_event_tables[log_event_table]])
-        unioned_log_table = unioned_log_table.append(table, ignore_index=True)
-    
-    for data_table in range(len(data_tables)):
-        # loads relevant data table
-        table = filter_data_table(table_data[data_tables[data_table]])
-        unioned_data_table = unioned_data_table.append(table, ignore_index=True)
-    
-    # loads user info table and merges with log table to find user_id
-    user_info = table_data['redcap_user_information'][['ui_id', 'username', 'user_email']]
-    unioned_log_table = (unioned_log_table.merge(user_info, left_on = 'user', right_on = 'username')).drop(columns=['username'])
-
-    data_dictionary = retrieve_data_dictionary()
-    data_dictionary = data_dictionary[['project_id', 'field_name','form_name']]
-    unioned_data_table = (unioned_data_table.merge(data_dictionary, on = ['project_id', 'field_name']))
-
-    cols = ['project_id', 'event_id', 'pk', 'instance', 'field_name', 'value']
-    
-    unioned_super_table = unioned_data_table.merge(unioned_log_table, left_on=cols, right_on=cols)
 
     # display(unioned_super_table)
 
@@ -1792,30 +1786,33 @@ def get_entry_of_missing(conn: mariadb.connections.Connection, project_id: int, 
 
     # print(f"{project_id} {event_id} {hnrcid} {field_name} {value} {repeat_instance}")
 
-    missing = unioned_super_table.copy()
-    if len(missing[(missing['form_name'] == form_name)]) > 0:
-        missing = missing[(missing['form_name'] == form_name)]
+    # unioned_super_table.to_csv(f'output_logs/user_id/unioned_super_table_{project_id}_{event_id}_{hnrcid}_{form_name}_{field_name}_{value}_{repeat_instance}_before.csv')
+
+    if len(unioned_super_table[(unioned_super_table['form_name'] == form_name)]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['form_name'] == form_name)]
         
-    if len(missing[(missing['event_id'].astype(int) == int(event_id))]) > 0:
-        missing = missing[(missing['event_id'].astype(int) == int(event_id))]
+    if len(unioned_super_table[(unioned_super_table['event_id'].astype(int) == int(event_id))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['event_id'].astype(int) == int(event_id))]
 
-    if len(missing[(missing['pk'].astype(int) == int(hnrcid))]) > 0:
-        missing = missing[(missing['pk'].astype(int) == int(hnrcid))]
+    if len(unioned_super_table[(unioned_super_table['pk'].astype(int) == int(hnrcid))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['pk'].astype(int) == int(hnrcid))]
 
-    if len(missing[(missing['instance'].astype(int) == int(repeat_instance))]) > 0:
-        missing = missing[(missing['instance'].astype(int) == int(repeat_instance))]
+    if len(unioned_super_table[(unioned_super_table['instance'].astype(int) == int(repeat_instance))]) > 0:
+        unioned_super_table = unioned_super_table[(unioned_super_table['instance'].astype(int) == int(repeat_instance))]
 
-    # display(missing)
+    # unioned_super_table.to_csv(f'output_logs/user_id/unioned_super_table_{project_id}_{event_id}_{hnrcid}_{form_name}_{field_name}_{value}_{repeat_instance}_after.csv')
 
-    if len(missing) == 0:
-        missing = retrieve_default_reviewer(project_id, form_name).reset_index(drop=True)
-        first_entry = missing.iloc[0]
+    if len(unioned_super_table) == 0:
+        unioned_super_table = retrieve_default_reviewer(project_id, form_name).reset_index(drop=True)
+        first_entry = unioned_super_table.iloc[0]
         official_user_id = int(first_entry['ui_id'])
         official_username = str(first_entry['user'])
         official_email = str(first_entry['user_email'])
     else:
-        missing = missing.reset_index(drop=True)
-        first_entry = missing.iloc[0]
+        unioned_super_table = unioned_super_table.reset_index(drop=True)
+        max_user_id = unioned_super_table['ui_id'].value_counts().idxmax()
+        first_entry = unioned_super_table[unioned_super_table['ui_id'] == max_user_id].iloc[0]
+        # first_entry = unioned_super_table.iloc[0]
 
         official_user_id = int(first_entry['ui_id'])
         official_username = str(first_entry['user'])
@@ -2050,7 +2047,7 @@ def find_missing_data(merged_data_table: pd.DataFrame, data_dictionary: pd.DataF
 
 
         return missing_data
-def missing_data_submission(project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int, missing_fields: list, ping: bool = True) -> None:
+def missing_data_submission(project_id: int, event_id: int, hnrcid: int, form_name: str, field_name: str, value: str, repeat_instance: int, missing_fields: list, official_user_id: int, username: str, email: str, ping: bool = True) -> None:
     """
     Submits a new data entry to the redcap_data_quality_status and redcap_data_quality_resolutions tables after checking for duplicates.
 
@@ -2071,7 +2068,7 @@ def missing_data_submission(project_id: int, event_id: int, hnrcid: int, form_na
     conn = connect_to_maria()
 
 
-    official_user_id, username, email = get_entry_of_missing(conn, project_id, event_id, hnrcid, form_name, field_name, value, repeat_instance)
+    
     log_msg = f'project_id {project_id}, hnrcid {hnrcid}, event_id {event_id}, repeat_instance {repeat_instance}, field_name {field_name}, value {value}, user {official_user_id}: {username} {email}. '
 
     dq_status = check_existing_drw_entry(project_id, event_id, hnrcid, field_name, official_user_id, repeat_instance)
@@ -2097,9 +2094,13 @@ def missing_data_submission(project_id: int, event_id: int, hnrcid: int, form_na
 
     return None
 
-def submit_stored_drw_entries() -> None:
+def submit_stored_drw_entries(alert_threshold: int = 100, production_mode: bool = False) -> None:
     """
     Retrieves csv file with stored DRW entries and submits any entries that do not exist in the DRW to REDCap
+
+    Args:
+        alert_threshold (int, optional): The threshold for the number of entries to submit (default is 100)
+        production_mode (bool, optional): A boolean indicating whether to run in production mode (default is False)
 
     Returns:
         None
@@ -2110,21 +2111,28 @@ def submit_stored_drw_entries() -> None:
     potential_submissions = potential_submissions.merge(drw_table, on=['project_id', 'event_id', 'record', 'field_name', 'instance'], how='left', indicator=True)
     potential_submissions = potential_submissions[potential_submissions['_merge'] == 'left_only']
     
-    logging.info(f"{len(potential_submissions)} entries to submit...")
-    counter = 0
-    for index, row in potential_submissions.iterrows():
-        if row['value'] == f"'Missing'":
-            missing_data_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'], row['form_name'])
-        else:
-            data_workflow_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'], row['form_name'])
-        # counter += 1
-        # if counter % 10 == 0:
-        #     time.sleep(3)
-    pd.DataFrame(columns=['project_id', 'event_id', 'record', 'form_name', 'field_name', 'value', 'instance']).to_csv('stored_data/drw_entries.csv', index=False)
+    logging.info(f"{len(potential_submissions)} entries to submit to REDCap.")
+    pid_list = potential_submissions['project_id'].unique()
+    unioned_super_table = get_unioned_super_table(pid_list)
+
+    if production_mode:
+        if len(potential_submissions) > alert_threshold:
+            send_error_email(f"More than {alert_threshold} entries to submit to REDCap. Please check the stored_data/drw_entries.csv file.")
+            potential_submissions = potential_submissions[~potential_submissions['approved'].isna()]
+
+        for index, row in potential_submissions.iterrows():
+            if row['value'] == f"'Missing'":
+                official_user_id, username, email = get_entry_of_missing(unioned_super_table, row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'])
+                missing_data_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'], row['form_name'], official_user_id, username, email)
+            else:
+                official_user_id, username, email = get_entry_of_outlier(unioned_super_table, row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'])
+                outlier_data_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['field_name'], row['value'], row['instance'], row['form_name'], official_user_id, username, email)
+    pd.DataFrame(columns=['project_id', 'event_id', 'record', 'form_name', 'field_name', 'value', 'instance', 'official_user_id', 'username', 'email','approved']).to_csv('stored_data/drw_entries.csv', index=False)
     return None
 
-def operate_missing_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.DataFrame, production_mode: bool = False) -> None: 
+def operate_missing_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.DataFrame, unioned_super_table: pd.DataFrame, production_mode: bool = False) -> None: 
     """
+    Operates the missing data detection and submission process for a given DataFrame. Finds fields that have been filled out at least once and checks for missing data entries.
 
     Args:
         merged_data_table (pd.DataFrame): The merged data table containing all data entries for a given project
@@ -2185,10 +2193,11 @@ def operate_missing_qc(merged_data_table: pd.DataFrame, data_entry_table: pd.Dat
     
     with open('stored_data/drw_entries.csv', 'a', newline='') as file:
         for _, row in missing_data.iterrows():
-            if production_mode:
-                logging.info(f"Detected missing data in proj {row['project_id']}: event {row['event_id']}, hnrcid {row['record']}, instance {row['instance']} - missing {row['missing_fields']}")
-                missing_data_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['missing_fields'], 'Missing', row['instance'], row['missing_fields'], ping = True)
-            file.write(f"{row['project_id']},{row['event_id']},{row['record']},{row['form_name']},{row['missing_fields']},'Missing',{row['instance']}\n")
+            # if production_mode:
+            #     logging.info(f"Detected missing data in proj {row['project_id']}: event {row['event_id']}, hnrcid {row['record']}, instance {row['instance']} - missing {row['missing_fields']}")
+            #     missing_data_submission(row['project_id'], row['event_id'], row['record'], row['form_name'], row['missing_fields'], 'Missing', row['instance'], row['missing_fields'], ping = True)
+            official_user_id, username, email = get_entry_of_missing(unioned_super_table, row['project_id'], row['event_id'], row['record'], row['form_name'], row['missing_fields'], 'Missing', row['instance'])
+            file.write(f"{row['project_id']},{row['event_id']},{row['record']},{row['form_name']},{row['missing_fields']},'Missing',{row['instance']},{official_user_id},{username},{email},\n")
 
     logging.info(f"Completed missing data detection and submission for form {missing_check_dict['form_name']} in project {missing_check_dict['project_id']} and event {missing_check_dict['event_id']}.")
     return None
@@ -2236,22 +2245,25 @@ def operate_quality_control_individual(data_entry: dict, outlier_method: str = '
     merged_data_table = merged_data_table[~merged_data_table['record'].isin(completed_user_list)]
     
 
+    unioned_super_table = get_unioned_super_table([proj_id])
+
     if missing_qc:
-        operate_missing_qc(merged_data_table, data_entry_table, production_mode)
+        operate_missing_qc(merged_data_table, data_entry_table, unioned_super_table, production_mode)
     if outlier_qc:
         # print(data_entry_table)
-        operate_outlier_qc(merged_data_table, data_entry_table, outlier_method, production_mode)
+        operate_outlier_qc(merged_data_table, data_entry_table, unioned_super_table, outlier_method, production_mode)
 
 
     return None
 
-def operate_quality_control_routine(data_entry: dict, merged_data_table: pd.DataFrame, outlier_method: str = 'Chauvanet', outlier_qc: bool = True, missing_qc: bool = True, routine: bool = False, production_mode: bool = False) -> None:
+def operate_quality_control_routine(data_entry: dict, merged_data_table: pd.DataFrame, unioned_super_table: pd.DataFrame, outlier_method: str = 'Chauvanet', outlier_qc: bool = True, missing_qc: bool = True, routine: bool = False, production_mode: bool = False) -> None:
     """
     Operates the quality control process on a data entry.
 
     Args:
         data_entry (dict): The data entry to operate the quality control process on
         merged_data_table (pd.DataFrame): The merged data table containing all data entries for a given project
+        unioned_super_table (pd.DataFrame): The unioned super table containing all data entries for a given project
         outlier_method (str, optional): The method to use for outlier detection (default is 'Chauvanet')
         outlier_qc (bool, optional): A boolean indicating whether to perform outlier quality control (default is True)
         missing_qc (bool, optional): A boolean indicating whether to perform missing data quality control (default is True)
@@ -2287,10 +2299,10 @@ def operate_quality_control_routine(data_entry: dict, merged_data_table: pd.Data
     
 
     if missing_qc:
-        operate_missing_qc(merged_data_table, data_entry_table, production_mode)
+        operate_missing_qc(merged_data_table, data_entry_table, unioned_super_table, production_mode)
     if outlier_qc:
         # print(data_entry_table)
-        operate_outlier_qc(merged_data_table, data_entry_table, outlier_method, production_mode)
+        operate_outlier_qc(merged_data_table, data_entry_table, unioned_super_table, outlier_method, production_mode)
 
 
     return None
@@ -2410,6 +2422,8 @@ def filter_missing_forms(pid_list: list, ping: bool = True, production_mode: boo
 
         missing_forms_list = find_empty_forms(data_dictionary, project_form_event_combos, pid_list)
 
+        unioned_super_table = get_unioned_super_table(pid_list)
+
         # if the event has entries, any empty forms are considered missing, except forms that have not been filled out yet by anyone
         # if someone has not filled out any form in that event, then it is not considered missing
         for i, missing_forms_project in enumerate(missing_forms_list):
@@ -2419,9 +2433,11 @@ def filter_missing_forms(pid_list: list, ping: bool = True, production_mode: boo
                 for index, row in missing_forms_project.iterrows():
                     if (((row['event_id'], row['form_name']) in filled_event_forms) and (row['missing_form'] == True) and (row['pk_missing_event'] == False) and (row['drw_exists'] == False)):
                         instance = 1
-                        if production_mode:
-                            missing_data_submission(row['project_id'], row['event_id'], row['pk'], row['form_name'], row['field_name_x'], 'Missing', instance, missing_fields=[row['form_name']], ping=ping)
-                        file.write(f"{row['project_id']},{row['event_id']},{row['pk']},{row['form_name']},{row['field_name_x']},'Missing',{instance}\n")
+                        official_user_id, username, email = get_entry_of_missing(unioned_super_table, row['project_id'], row['event_id'], row['pk'], row['form_name'], row['field_name_x'], 'Missing', instance)
+                        # if production_mode:
+                        #     missing_data_submission(row['project_id'], row['event_id'], row['pk'], row['form_name'], row['field_name_x'], 'Missing', instance, [row['form_name']], official_user_id, username, email, ping=ping)
+                        file.write(f"{row['project_id']},{row['event_id']},{row['pk']},{row['form_name']},{row['field_name_x']},'Missing',{instance},{official_user_id},{username},{email},\n")
+            gc.collect()
 
     return None
 
@@ -2458,12 +2474,14 @@ def check_for_all_outliers(pid_list: list, outlier_method = 'Chauvanet', alert_t
     data_dictionary = data_dictionary[(data_dictionary['element_validation_type'] == 'int') | (data_dictionary['element_validation_type'] == 'float')]
     project_field_combos = data_dictionary[['project_id', 'field_name']].drop_duplicates().reset_index(drop=True)
 
+    unioned_super_table = get_unioned_super_table(pid_list)
+
     data_table_names = []
     for pid in pid_list:
         log_table_name, data_table_name = get_log_event_and_data_tables(pid)
         for data_table in data_table_name:
             data_table_names.append(data_table)
-    
+
     data_tables = retrieve_database_table(data_table_names)
     merged_data_table = pd.concat(data_tables.values())
 
@@ -2522,7 +2540,7 @@ def check_for_all_outliers(pid_list: list, outlier_method = 'Chauvanet', alert_t
             redcap_data['project_id'] = row['project_id']
             redcap_data['field_name'] = row['field_name']
 
-            operate_quality_control_routine(redcap_data, merged_data_table, outlier_method, outlier_qc = True, missing_qc = False, routine=True, production_mode=production_mode)
+            operate_quality_control_routine(redcap_data, merged_data_table, unioned_super_table, outlier_method, outlier_qc = True, missing_qc = False, routine=True, production_mode=production_mode)
 
             set_last_checked(outlier_file_name, f"{row['project_id']} {row['field_name']}")
 
@@ -2530,7 +2548,8 @@ def check_for_all_outliers(pid_list: list, outlier_method = 'Chauvanet', alert_t
             if (((status_id_count_now - status_id_count) > alert_threshold) and (not alert_sent)):
                 send_error_email(message=f"Alarming number of DRW entries ({status_id_count_now - status_id_count}) have been created recently. Please check the DRW table.")
                 alert_sent = True
-
+            
+            gc.collect()
         set_last_checked(outlier_file_name, f"Finished")
     logging.info("All outlier data entries have been checked.")
     return None
@@ -2568,12 +2587,14 @@ def check_for_all_missing(pid_list: list, alert_threshold: int = 100, ping: bool
     project_form_event_combos = project_form_event_combos[(project_form_event_combos['field_name'].str.contains('_complete', case=False, na=False))]
     project_form_event_combos = project_form_event_combos.drop(columns=['form_name'])
 
+    unioned_super_table = get_unioned_super_table(pid_list)
+
     data_table_names = []
     for pid in pid_list:
         log_table_name, data_table_name = get_log_event_and_data_tables(pid)
         for data_table in data_table_name:
             data_table_names.append(data_table)
-    
+
     data_tables = retrieve_database_table(data_table_names)
     merged_data_table = pd.concat(data_tables.values())
 
@@ -2628,7 +2649,7 @@ def check_for_all_missing(pid_list: list, alert_threshold: int = 100, ping: bool
         redcap_data['event_id'] = row['event_id']
         redcap_data['field_name'] = row['field_name']
         redcap_data['instance'] = 1
-        operate_quality_control_routine(redcap_data, merged_data_table, outlier_method = '', outlier_qc = False, missing_qc = True, routine=True, production_mode=production_mode)
+        operate_quality_control_routine(redcap_data, merged_data_table, unioned_super_table, outlier_method = '', outlier_qc = False, missing_qc = True, routine=True, production_mode=production_mode)
 
         set_last_checked(file_name, f"{row['project_id']} {row['event_id']} {row['field_name']}")
 
@@ -2637,6 +2658,7 @@ def check_for_all_missing(pid_list: list, alert_threshold: int = 100, ping: bool
             send_error_email(message=f"Alarming number of DRW entries ({status_id_count_now - status_id_count}) have been created recently. Please check the DRW table.")
             alert_sent = True
 
+        gc.collect()
     set_last_checked(file_name, f"Finished")
     logging.info("All missing data entries have been checked.")
     return None
@@ -2656,38 +2678,14 @@ def check_for_all_outlier_and_missing(pid_list: list, outlier_method: str = 'Cha
         None
     """
     refresh_all_stored_data()
+    check_drw_enabled(pid_list)
     if production_mode:
         resolve_open_queries(pid_list)
-    check_drw_enabled(pid_list)
     filter_missing_forms(pid_list, ping, production_mode)
-    check_for_all_outliers(pid_list, outlier_method, alert_threshold, ping, production_mode)
-    check_for_all_missing(pid_list, alert_threshold, ping, production_mode)
-    return None
-
-def test():
-    # pid_list = [25,19]
-    # pid_list = [129, 146, 151]
-    # check_for_all_outlier_and_missing(pid_list)
-    # check_for_all_missing(pid_list)
-    
-    # # redcap_data = {'log_event_id': 1530, 'project_id': 25, 'ts': 20241209182024, 'user': 'dgandh03', 'ip': '192.168.9.56', 'page': 'DataEntry/index.php', 'event': 'UPDATE', 'object_type': 'redcap_data', 'sql_log': "UPDATE redcap_data4 SET value = '29' WHERE project_id = 25 AND record = '42964' AND event_id = 414 AND field_name = 'v_pulse' AND instance is NULL;\nDELETE FROM redcap_data4 WHERE project_id = 25 AND record = '42964' AND event_id = 414 AND field_name = 'v_resp' AND instance is NULL;\nDELETE FROM redcap_data4 WHERE project_id = 25 AND record = '42964' AND event_id = 414 AND field_name = 'v_bp_sys' AND instance is NULL", 'pk': '42964', 'event_id': 414, 'data_values': "v_pulse = '29',\nv_resp = '',\nv_bp_sys = ''", 'description': 'Update record', 'legacy': 0, 'change_reason': None}
-    # # operate_quality_control(redcap_data)
-    # submit_stored_drw_entries()
-
-    # pid_list = [25,19]
-    pid_list = [129, 146, 151]
-    production_mode = False
-    check_last_run()
-    if production_mode:
-            send_periodic_email()
     with open('stored_data/last_routine.log', 'w') as file:
         file.write(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    check_for_all_outlier_and_missing(pid_list, production_mode = production_mode, ping = False)
-    # check_for_all_outliers(pid_list, production_mode = production_mode, ping = False)
-
-    # submit_stored_drw_entries()
+    check_for_all_outliers(pid_list, outlier_method, alert_threshold, ping, production_mode)
+    check_for_all_missing(pid_list, alert_threshold, ping, production_mode)
+    if production_mode:
+        submit_stored_drw_entries(alert_threshold, production_mode)
     return None
-
-# test()
-
-

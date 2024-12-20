@@ -10,12 +10,14 @@ app = flask.Flask(__name__)
 
 # _____________________________________________
 # MAKE CHANGES HERE
-outlier_method = 'Chauvanet'     # 'Chauvanet', 'QQ', 'Pierce'
-# pid_list = [25, 19]
+# MODIFY .env FILE FOR SENSITIVE INFORMATION (passwords, emails, etc. )
+# MODIFY stored_data/ip_list.txt FOR AUTHORIZED IP ADDRESSES
+# MODIFY stored_data/default_reviewers.csv FOR DEFAULT REVIEWERS
 pid_list = [146, 129, 151]      # list of project ids
-alert_threshold = 100           # number of drw entries in an interval 
+outlier_method = 'Chauvanet'     # 'Chauvanet', 'QQ', 'Pierce'
+alert_threshold = 100           # if the number of drw entries surpasses this number, send an email and only submit approved entries
 ping = False                    # send redcap messenger ping
-production_mode = False         # True to submit data to redcap server
+production_mode = False         # True to submit drw entries to redcap server
 routine_hours = 9               # Sends an email if the last routine was more than this many hours ago
 # _____________________________________________
 
@@ -34,7 +36,6 @@ def common_troubleshooting():
     """
     return_links = f'<h3>Common Troubleshooting</h3>'
     return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/update-triggers/">Update Triggers</a> <br>'
-    return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/update-data-dic/">Update Data Dictionary</a> <br>'
     return return_links
 
 def logfile_tail():
@@ -55,7 +56,6 @@ def routing_links():
     return_links += f'<a href="https://redcom.hnrc.tufts.edu">https://redcom.hnrc.tufts.edu</a> <br>'
     return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/">https://redcom.hnrc.tufts.edu/flaskApp/</a> <br>'
     return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/update-triggers/">https://redcom.hnrc.tufts.edu/flaskApp/update-triggers/</a> <br>'
-    return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/update-data-dic/">https://redcom.hnrc.tufts.edu/flaskApp/update-data-dic/</a> <br>'
     return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/outliers-and-missing-routine/">https://redcom.hnrc.tufts.edu/flaskApp/outliers-and-missing-routine/</a> <br>'
     return_links += f'<a href="https://redcom.hnrc.tufts.edu/flaskApp/receive-from-maria/">https://redcom.hnrc.tufts.edu/flaskApp/receive-from-maria/</a> <br>'
     return return_links
@@ -89,19 +89,6 @@ def update_triggers():
     thread_store.start()
     return 'Processing triggers in the background \n' + default_page()
 
-@app.route('/flaskApp/update-data-dic/', methods=['GET', 'POST'])
-def update_data_dic_triggers():
-    """
-    Routed from /flaskApp/update-data-dic/ and when triggered by POST request from MariaDB.
-    POST request is triggered when metadata table is updated.
-
-    Refreshes stored data dictionary.
-    """
-    # when the metadata (data dictionary) table is updated. 
-    thread_dd = threading.Thread(target=store_data_dictionary)
-    thread_dd.start()
-    return 'Processing data dictionary in the background \n' + default_page()
-
 @app.route('/flaskApp/outliers-and-missing-routine/', methods=['POST'])
 def outlier_and_missing_routine():
     """
@@ -113,8 +100,6 @@ def outlier_and_missing_routine():
     check_last_run(hours=routine_hours)
     if production_mode:
         send_periodic_email()
-    with open('stored_data/last_routine.log', 'w') as file:
-        file.write(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     thread_check = threading.Thread(target=check_for_all_outlier_and_missing, kwargs={'pid_list': pid_list, 
                                                                                       'outlier_method': outlier_method, 
                                                                                       'alert_threshold': alert_threshold, 
@@ -162,14 +147,16 @@ def receive_from_maria():
                 redcap_data[data_field] = data.get(data_field, None)
 
             logging.info(f"inputted redcap_data: {redcap_data}")
-
-            thread_qc = threading.Thread(target=operate_quality_control_individual, kwargs={'data_entry': redcap_data, 
-                                                                                            'outlier_method': outlier_method, 
-                                                                                            'outlier_qc': True, 
-                                                                                            'missing_qc': True, 
-                                                                                            'routine': False, 
-                                                                                            'production_mode': production_mode})
-            thread_qc.start()
+            if production_mode:
+                # only for projects in list. Comment out for all projects
+                if redcap_data['project_id'] in pid_list:
+                    thread_qc = threading.Thread(target=operate_quality_control_individual, kwargs={'data_entry': redcap_data, 
+                                                                                                    'outlier_method': outlier_method, 
+                                                                                                    'outlier_qc': True, 
+                                                                                                    'missing_qc': True, 
+                                                                                                    'routine': False, 
+                                                                                                    'production_mode': production_mode})
+                    thread_qc.start()
         else:
             logging.info(f"Unauthorized access from {flask.request.remote_addr}")
             return 'Unauthorized access \n'
