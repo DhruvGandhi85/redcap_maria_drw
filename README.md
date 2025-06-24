@@ -1,5 +1,61 @@
 <!-- markdownlint-disable -->
 
+
+# Data Cleaning Pipeline for RedCap EDC
+
+## Initial Pipeline
+
+1. **Data Entry**
+   - Nurse inputs data into the RedCap Electronic Data Capture (EDC) system.
+   - Data is stored in a MariaDB MySQL server within a Linux environment.
+
+2. **Initial Data Cleaning**
+   - Data is pulled from the RedCap API on a weekly basis.
+   - Outlier and missing values are identified and stored in a CSV file.
+   - The CSV file is shared with the project manager.
+
+### Inefficiencies in Initial Workflow
+
+- Operates on a scheduled cycle — users are often alerted days after entering data.
+- Project managers usually lack context on specific data entries and must track down users (often unsuccessfully).
+- API calls contribute to log table bloat in RedCap.
+- Manual communication chain: Data manager → Project manager → Data entry personnel.
+
+---
+
+## New Data Cleaning Pipeline
+
+1. **Real-Time Trigger-Based Workflow**
+   - Upon data entry in RedCap, a MySQL **trigger** sends a POST request to a **Flask server**.
+   - The Flask server (hosted via **Windows IIS** on the HNRCA intranet) remotely connects to the MySQL server.
+
+2. **Automated Validation Process**
+   - Identifies outlier/missing values for the specific form and patient.
+   - Retrieves the username of the nurse who entered the data.
+   - Inserts an entry into the `DataResolutionWorkflow` table with:
+     - Specific field
+     - Assigned nurse
+     - Comment (`outlier` or `missing`)
+   - Inserts a message into the `messenger` table, alerting the nurse and linking to the form.
+   - Automatically resolves pre-existing DRW entries if applicable (no need for manual resolution by the nurse).
+
+3. **Routine Background Sweep (Every 90 Minutes)**
+   - MySQL procedure scans entire database for:
+     - Outlier values
+     - Entirely missing forms (if patient has other form data entered)
+   - Determines most relevant nurse based on project roles.
+   - Sends daily email reminders if unresolved DRW entries are older than 24 hours.
+
+### Improvements in New Workflow
+
+- DRW entries and messenger alerts are created **immediately** after form submission.
+- Nurses can **instantly resolve** flagged entries, reducing lag in data correction.
+- **Eliminates verbal communication** loops — system targets the correct nurse.
+- **Direct MySQL access** avoids clogging RedCap log tables.
+- Only **manual work** required is by the nurse who originally entered the data.
+- Periodic 90-minute sweep ensures **backup coverage** in case of missed events.
+
+
 # API Overview
 
 ## Modules
